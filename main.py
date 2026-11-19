@@ -213,125 +213,17 @@ class FortunePlugin(Star):
         ]
         return "\n".join(lines)
     
-    async def _handle_none_generation(self, event: AstrMessageEvent, source_name: str = None):
-        """处理纯背景图片获取逻辑"""
-        moderator = self._get_moderator()
-        moderation_retries = moderator.get_max_retries() if moderator.is_enabled() else 0
-        max_retries = max(moderation_retries, self._get_background_retry_count())
-        
-        retries = 0
-        last_error = None
-        failed_sources = set()
-        
-        while retries <= max_retries:
-            actual_source = None
-            try:
-                bg_manager = self._get_background_manager()
-                bg_spec = bg_manager.get_background_spec(
-                    source_name,
-                    excluded_sources=failed_sources if not source_name else None,
-                )
-                
-                if not bg_spec:
-                    if failed_sources and not source_name:
-                        yield event.plain_result(
-                            f"获取失败: 所有可用图源均连接失败，最后错误: {last_error or '未知错误'}"
-                        )
-                        return
-                    if source_name:
-                        yield event.plain_result(f"未找到指定的图源: {source_name}")
-                    else:
-                        yield event.plain_result("暂无背景图源配置，请检查 backgrounds.json~")
-                    return
+    async def _acquire_approved_background(
+        self,
+        source_name: str | None = None,
+        *,
+        action_label: str = "生成",
+    ) -> tuple:
+        """统一执行选图源、下载背景、图片审查、打码与失败切源重试。
 
-                actual_source = self._get_source_name_from_spec(bg_spec, bg_manager)
-
-                background, _ = await bg_manager.get_background_and_addition(bg_spec)
-                
-                if not background:
-                    raise Exception("无法加载背景图片")
-                
-                # 图片审查
-                if moderator.is_enabled():
-                    logger.info(f"[运势生成] 开始图片审查，重试次数: {retries}/{max_retries}")
-                    passed, reason, bboxes = await moderator.moderate(background)
-                    logger.info(f"[运势生成] 审查结果: passed={passed}, reason={reason}, bboxes={bboxes}")
-                    
-                    if not passed:
-                        failed_action = moderator.get_failed_action()
-                        
-                        # 打码模式
-                        if failed_action == "mosaic" and bboxes:
-                            logger.info(f"[运势生成] 打码模式：对 {len(bboxes)} 个区域应用马赛克")
-                            mosaiced = ImageUtils.apply_mosaic_multi(
-                                background, bboxes, moderator.get_mosaic_block_size()
-                            )
-                            if mosaiced is not background:
-                                background.close()
-                                background = mosaiced
-                            # 打码后继续使用这张图片
-                        else:
-                            # 其他模式：重试
-                            background.close()
-                            logger.warning(f"图片审查未通过: {reason}, 重试中...")
-                            retries += 1
-                            last_error = f"图片审查未通过: {reason}"
-                            continue
-                else:
-                    logger.info("[运势生成] 图片审查未启用")
-                
-                def _render_none_to_bytes(src_bg) -> bytes:
-                    try:
-                        result_image = ImageUtils.process_background(src_bg)
-                        buf = BytesIO()
-                        try:
-                            result_image.save(buf, format="JPEG", quality=95)
-                            return buf.getvalue()
-                        finally:
-                            buf.close()
-                            result_image.close()
-                    finally:
-                        src_bg.close()
-
-                transferred_to_worker = False
-                try:
-                    async with self._get_render_semaphore():
-                        transferred_to_worker = True
-                        jpeg_bytes = await asyncio.to_thread(
-                            _render_none_to_bytes, background
-                        )
-                finally:
-                    if not transferred_to_worker:
-                        background.close()
-
-                with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as f:
-                    f.write(jpeg_bytes)
-                    temp_path = f.name
-                
-                try:
-                    yield event.image_result(temp_path)
-                finally:
-                    with contextlib.suppress(OSError):
-                        os.remove(temp_path)
-                return
-                    
-            except Exception as e:
-                logger.error(f"获取背景图片失败: {e}")
-                last_error = str(e)
-                if actual_source and not source_name:
-                    failed_sources.add(actual_source)
-                    logger.warning(
-                        f"[背景获取] 图源 {actual_source} 不可用，将自动切换其他图源"
-                    )
-                retries += 1
-        
-        yield event.plain_result(f"获取失败: {last_error or '重试次数已达上限'}")
-
-    async def _handle_fortune_generation(self, event: AstrMessageEvent, source_name: str = None):
-        """处理运势图片生成逻辑"""
-        user_id = event.get_sender_id()
-        user_name = event.get_sender_name()
-
+        Returns:
+            ``(background, addition_text, error_message)``；成功时 ``error_message`` 为 ``None``。
+        """
         moderator = self._get_moderator()
         moderation_retries = moderator.get_max_retries() if moderator.is_enabled() else 0
         max_retries = max(moderation_retries, self._get_background_retry_count())
@@ -340,18 +232,18 @@ class FortunePlugin(Star):
         retries = 0
         last_error = None
         current_source = source_name
-        tried_sources = set()  # 记录已尝试的图源
-        failed_sources = set()  # 网络或解析失败后不再选择这些图源
+        tried_sources = set()
+        failed_sources = set()
 
         while retries <= max_retries:
             actual_source = None
+            background = None
             try:
                 bg_manager = self._get_background_manager()
 
-                # 如果是切换图源模式且已经尝试过当前图源，则选择新图源
                 if failed_action == "switch_source" and current_source and current_source in tried_sources:
                     logger.info(f"[运势生成] 切换图源模式 - 已尝试过 {current_source}，选择新图源")
-                    current_source = None  # 让系统随机选择
+                    current_source = None
 
                 bg_spec = bg_manager.get_background_spec(
                     current_source,
@@ -360,150 +252,205 @@ class FortunePlugin(Star):
 
                 if not bg_spec:
                     if failed_sources and not source_name:
-                        yield event.plain_result(
-                            f"生成失败: 所有可用图源均连接失败，最后错误: {last_error or '未知错误'}"
+                        return (
+                            None,
+                            "",
+                            f"{action_label}失败: 所有可用图源均连接失败，最后错误: {last_error or '未知错误'}",
                         )
-                        return
                     if source_name:
-                        yield event.plain_result(f"未找到指定的图源: {source_name}")
-                    else:
-                        yield event.plain_result("暂无背景图源配置，请检查 backgrounds.json~")
-                    return
+                        return None, "", f"未找到指定的图源: {source_name}"
+                    return None, "", "暂无背景图源配置，请检查 backgrounds.json~"
 
-                # 获取实际使用的图源名称
                 actual_source = self._get_source_name_from_spec(bg_spec, bg_manager)
                 if actual_source:
                     tried_sources.add(actual_source)
                     logger.info(f"[运势生成] 使用图源: {actual_source}")
 
                 background, addition_text = await bg_manager.get_background_and_addition(bg_spec)
-
                 if not background:
                     raise Exception("无法加载背景图片")
 
-                # 图片审查 - 检查是否需要审核此图源
                 if moderator.is_enabled() and actual_source:
-                    should_moderate = moderator.should_moderate_source(actual_source)
-
-                    if should_moderate:
+                    if moderator.should_moderate_source(actual_source):
                         logger.info(f"[运势生成] 图源 {actual_source} 需要审核，开始图片审查，重试次数: {retries}/{max_retries}")
                         passed, reason, bboxes = await moderator.moderate(background)
                         logger.info(f"[运势生成] 审查结果: passed={passed}, reason={reason}, bboxes={bboxes}")
 
                         if not passed:
-                            # 打码模式
                             if failed_action == "mosaic" and bboxes:
                                 logger.info(f"[运势生成] 打码模式：对 {len(bboxes)} 个区域应用马赛克")
-                                mosaiced = ImageUtils.apply_mosaic_multi(
-                                    background, bboxes, moderator.get_mosaic_block_size()
+                                block_size = moderator.get_mosaic_block_size()
+                                mosaiced = await asyncio.to_thread(
+                                    ImageUtils.apply_mosaic_multi,
+                                    background,
+                                    bboxes,
+                                    block_size,
                                 )
                                 if mosaiced is not background:
                                     background.close()
                                     background = mosaiced
-                                # 打码后继续使用这张图片
                             else:
                                 background.close()
+                                background = None
                                 logger.warning(f"图片审查未通过: {reason}")
                                 retries += 1
                                 last_error = f"图片审查未通过: {reason}"
 
-                                # 根据配置的失败行为处理
                                 if failed_action == "notify_user":
-                                    yield event.plain_result(f"背景图因审查不通过无法生成运势\n原因: {reason}")
-                                    return
-                                elif failed_action == "switch_source":
-                                    logger.info(f"[运势生成] 失败行为: 切换图源")
+                                    return None, "", f"背景图因审查不通过无法{action_label}\n原因: {reason}"
+                                if failed_action == "switch_source":
+                                    logger.info("[运势生成] 失败行为: 切换图源")
                                     if actual_source:
                                         failed_sources.add(actual_source)
-                                    current_source = None  # 下次循环会选择新图源
-                                else:  # retry_same
-                                    logger.info(f"[运势生成] 失败行为: 从同一图源重新取图")
-
+                                    current_source = None
+                                else:
+                                    logger.info("[运势生成] 失败行为: 从同一图源重新取图")
                                 continue
                     else:
                         logger.info(f"[运势生成] 图源 {actual_source} 在过滤列表中，跳过审核")
                 else:
                     logger.info("[运势生成] 图片审查未启用或无法确定图源")
 
-                # 获取头像
-                avatar_url = await self._get_avatar_url(event)
-                avatar = None
-                transferred_to_worker = False
-                try:
-                    try:
-                        from .utils import HttpUtils
-                        avatar = await HttpUtils.download_image(
-                            avatar_url,
-                            timeout=10,
-                            proxy=self._get_proxy(),
-                            session=self._get_http_session(),
-                        )
-                    except Exception as e:
-                        logger.warning(f"下载头像失败: {e}，将使用默认空白头像")
-                        from PIL import Image
-                        avatar = Image.new('RGB', (100, 100), (200, 200, 200))
-
-                    fortune_data = self.fortune_generator.get_fortune_for_user(user_id)
-
-                    def _render_fortune_to_bytes(src_bg, src_avatar) -> tuple[bytes, bytes]:
-                        try:
-                            result_image, bg_bytes = self.fortune_generator.create_fortune_image(
-                                src_bg,
-                                src_avatar,
-                                user_name,
-                                fortune_data,
-                                addition_text,
-                                return_background_bytes=True,
-                            )
-                            buf = BytesIO()
-                            try:
-                                result_image.save(buf, format="JPEG", quality=90)
-                                return buf.getvalue(), bg_bytes
-                            finally:
-                                buf.close()
-                                result_image.close()
-                        finally:
-                            src_bg.close()
-                            if src_avatar is not None:
-                                src_avatar.close()
-
-                    async with self._get_render_semaphore():
-                        transferred_to_worker = True
-                        result_bytes, bg_bytes = await asyncio.to_thread(
-                            _render_fortune_to_bytes, background, avatar
-                        )
-                finally:
-                    if not transferred_to_worker:
-                        background.close()
-                        if avatar is not None:
-                            avatar.close()
-
-                # 出图成功后才原子更新 /last 缓存，避免并发覆写或失败污染
-                self._store_last_background(user_id, bg_bytes)
-
-                with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as f:
-                    f.write(result_bytes)
-                    temp_path = f.name
-
-                try:
-                    yield event.image_result(temp_path)
-                finally:
-                    with contextlib.suppress(OSError):
-                        os.remove(temp_path)
-                return
+                return background, addition_text, None
 
             except Exception as e:
-                logger.error(f"生成运势图片失败: {e}")
+                if background is not None:
+                    background.close()
+                logger.error(f"{action_label}背景图片失败: {e}")
                 last_error = str(e)
                 if actual_source and not source_name:
                     failed_sources.add(actual_source)
-                    logger.warning(
-                        f"[运势生成] 图源 {actual_source} 不可用，将自动切换其他图源"
-                    )
+                    logger.warning(f"[{action_label}] 图源 {actual_source} 不可用，将自动切换其他图源")
                     current_source = None
                 retries += 1
-        
-        yield event.plain_result(f"生成失败: {last_error or '重试次数已达上限'}")
+
+        return None, "", f"{action_label}失败: {last_error or '重试次数已达上限'}"
+
+    async def _handle_none_generation(self, event: AstrMessageEvent, source_name: str = None):
+        """处理纯背景图片获取逻辑"""
+        background, _, error_msg = await self._acquire_approved_background(
+            source_name, action_label="获取"
+        )
+        if error_msg or background is None:
+            yield event.plain_result(error_msg or "获取失败: 未知错误")
+            return
+
+        def _render_none_to_bytes(src_bg) -> bytes:
+            try:
+                result_image = ImageUtils.process_background(src_bg)
+                buf = BytesIO()
+                try:
+                    result_image.save(buf, format="JPEG", quality=95)
+                    return buf.getvalue()
+                finally:
+                    buf.close()
+                    result_image.close()
+            finally:
+                src_bg.close()
+
+        transferred_to_worker = False
+        try:
+            async with self._get_render_semaphore():
+                transferred_to_worker = True
+                jpeg_bytes = await asyncio.to_thread(_render_none_to_bytes, background)
+        except Exception as e:
+            logger.error(f"处理背景图片失败: {e}")
+            yield event.plain_result(f"获取失败: {e}")
+            return
+        finally:
+            if not transferred_to_worker:
+                background.close()
+
+        with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as f:
+            f.write(jpeg_bytes)
+            temp_path = f.name
+
+        try:
+            yield event.image_result(temp_path)
+        finally:
+            with contextlib.suppress(OSError):
+                os.remove(temp_path)
+
+    async def _handle_fortune_generation(self, event: AstrMessageEvent, source_name: str = None):
+        """处理运势图片生成逻辑"""
+        user_id = event.get_sender_id()
+        user_name = event.get_sender_name()
+
+        background, addition_text, error_msg = await self._acquire_approved_background(
+            source_name, action_label="生成"
+        )
+        if error_msg or background is None:
+            yield event.plain_result(error_msg or "生成失败: 未知错误")
+            return
+
+        avatar_url = await self._get_avatar_url(event)
+        avatar = None
+        transferred_to_worker = False
+        try:
+            try:
+                from .utils import HttpUtils
+                avatar = await HttpUtils.download_image(
+                    avatar_url,
+                    timeout=10,
+                    proxy=self._get_proxy(),
+                    session=self._get_http_session(),
+                )
+            except Exception as e:
+                logger.warning(f"下载头像失败: {e}，将使用默认空白头像")
+                from PIL import Image
+                avatar = Image.new('RGB', (100, 100), (200, 200, 200))
+
+            fortune_data = self.fortune_generator.get_fortune_for_user(user_id)
+
+            def _render_fortune_to_bytes(src_bg, src_avatar) -> tuple[bytes, bytes]:
+                try:
+                    result_image, bg_bytes = self.fortune_generator.create_fortune_image(
+                        src_bg,
+                        src_avatar,
+                        user_name,
+                        fortune_data,
+                        addition_text,
+                        return_background_bytes=True,
+                    )
+                    buf = BytesIO()
+                    try:
+                        result_image.save(buf, format="JPEG", quality=90)
+                        return buf.getvalue(), bg_bytes
+                    finally:
+                        buf.close()
+                        result_image.close()
+                finally:
+                    src_bg.close()
+                    if src_avatar is not None:
+                        src_avatar.close()
+
+            async with self._get_render_semaphore():
+                transferred_to_worker = True
+                result_bytes, bg_bytes = await asyncio.to_thread(
+                    _render_fortune_to_bytes, background, avatar
+                )
+        except Exception as e:
+            logger.error(f"生成运势图片失败: {e}")
+            yield event.plain_result(f"生成失败: {e}")
+            return
+        finally:
+            if not transferred_to_worker:
+                background.close()
+                if avatar is not None:
+                    avatar.close()
+
+        # 出图成功后才原子更新 /last 缓存，避免并发覆写或失败污染
+        self._store_last_background(user_id, bg_bytes)
+
+        with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as f:
+            f.write(result_bytes)
+            temp_path = f.name
+
+        try:
+            yield event.image_result(temp_path)
+        finally:
+            with contextlib.suppress(OSError):
+                os.remove(temp_path)
 
     @filter.command("jrys", alias=["今日运势", "运势"])
     async def jrys_cmd(self, event: AstrMessageEvent):
