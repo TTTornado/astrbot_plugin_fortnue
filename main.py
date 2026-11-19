@@ -207,6 +207,7 @@ class FortunePlugin(Star):
         """将运势数据格式化为纯文本"""
         fortune_data = self.fortune_generator.get_fortune_for_user(user_id)
         fortune = fortune_data["fortune"]
+        fortune_level = self.fortune_generator.display_fortune_level(fortune["level"])
         lucky_color = fortune_data["lucky_color"]
         lucky_number = fortune_data["lucky_number"]
         advice = fortune_data["advice"]
@@ -219,7 +220,7 @@ class FortunePlugin(Star):
         lines = [
             f"✦ {user_name or '你'} 的今日运势 ✦" if user_name else "✦ 今日运势 ✦",
             f"日期：{today_str}",
-            f"运势等级：{fortune['level']}",
+            f"运势等级：{fortune_level}",
             f"运势描述：{fortune['desc']}",
             f"幸运指数：{luck_value}%",
             f"幸运色：{color_name}({color_hex})" if color_name else f"幸运色：{color_hex}",

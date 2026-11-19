@@ -211,6 +211,10 @@ class FortuneGenerator:
         
         return result_data
     
+    @staticmethod
+    def display_fortune_level(level: str) -> str:
+        return level.replace("凶", "区")
+
     def create_fortune_image(self, background: Image.Image, avatar: Image.Image | None,
                              user_name: str, fortune_data: dict, addition_text: str = "") -> Image.Image:
         """在背景图上叠加运势信息（未达目标尺寸时自动复用 process_background 一步裁剪缩放）。"""
@@ -278,7 +282,7 @@ class FortuneGenerator:
             name_x = avatar_x + avatar_size + 30
             name_y = avatar_y + 20
             date_str = datetime.now().strftime("%Y年%m月%d日")
-            fortune_level = fortune["level"]
+            fortune_level = self.display_fortune_level(fortune["level"])
             desc_y = content_start_y + 180
             bar_y = desc_y + 80
             bar_width = 400
