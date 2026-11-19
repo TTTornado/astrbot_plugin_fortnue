@@ -8,7 +8,6 @@ from astrbot.api import logger, llm_tool
 import asyncio
 from collections import OrderedDict
 import contextlib
-from io import BytesIO
 import os
 import tempfile
 import weakref
@@ -347,63 +346,30 @@ class FortunePlugin(Star):
 
         return None, "", f"{action_label}失败: {last_error or '重试次数已达上限'}"
 
-    async def _handle_none_generation(self, event: AstrMessageEvent, source_name: str = None):
-        """处理纯背景图片获取逻辑"""
-        sem = self._get_image_semaphore()
-        await sem.acquire()
-        background = None
-        transferred_to_worker = False
-        slot_transferred = False
+    async def _send_jpeg_bytes(self, event: AstrMessageEvent, jpeg_bytes: bytes):
+        """将 JPEG 字节写入临时文件发送并在发送后清理。"""
+        temp_path = None
         try:
-            background, _, error_msg = await self._acquire_approved_background(
-                source_name, action_label="获取"
-            )
-            if error_msg or background is None:
-                yield event.plain_result(error_msg or "获取失败: 未知错误")
-                return
-
-            def _render_none_to_bytes(src_bg) -> bytes:
-                try:
-                    result_image = ImageUtils.process_background(src_bg)
-                    buf = BytesIO()
-                    try:
-                        result_image.save(buf, format="JPEG", quality=95)
-                        return buf.getvalue()
-                    finally:
-                        buf.close()
-                        result_image.close()
-                finally:
-                    src_bg.close()
-
-            transferred_to_worker = True
-            slot_transferred = True
-            jpeg_bytes = await self._run_worker_holding_slot(
-                sem, _render_none_to_bytes, background
-            )
-        except Exception as e:
-            logger.error(f"处理背景图片失败: {e}")
-            yield event.plain_result(f"获取失败: {e}")
-            return
-        finally:
-            if not transferred_to_worker and background is not None:
-                background.close()
-            if not slot_transferred:
-                sem.release()
-
-        with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as f:
-            f.write(jpeg_bytes)
-            temp_path = f.name
-
-        try:
+            with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as f:
+                f.write(jpeg_bytes)
+                temp_path = f.name
             yield event.image_result(temp_path)
         finally:
-            with contextlib.suppress(OSError):
-                os.remove(temp_path)
+            if temp_path:
+                with contextlib.suppress(OSError):
+                    os.remove(temp_path)
 
-    async def _handle_fortune_generation(self, event: AstrMessageEvent, source_name: str = None):
-        """处理运势图片生成逻辑"""
-        user_id = event.get_sender_id()
-        user_name = event.get_sender_name()
+    async def _handle_image_generation(
+        self,
+        event: AstrMessageEvent,
+        source_name: str = None,
+        *,
+        include_fortune: bool = True,
+    ):
+        """统一处理纯背景图（/jrysn）与运势图（/jrys）生成流水线。"""
+        action_label = "生成" if include_fortune else "获取"
+        user_id = event.get_sender_id() if include_fortune else ""
+        user_name = event.get_sender_name() if include_fortune else ""
 
         sem = self._get_image_semaphore()
         await sem.acquire()
@@ -413,58 +379,69 @@ class FortunePlugin(Star):
         slot_transferred = False
         try:
             background, addition_text, error_msg = await self._acquire_approved_background(
-                source_name, action_label="生成"
+                source_name, action_label=action_label
             )
             if error_msg or background is None:
-                yield event.plain_result(error_msg or "生成失败: 未知错误")
+                yield event.plain_result(error_msg or f"{action_label}失败: 未知错误")
                 return
 
-            avatar_url = await self._get_avatar_url(event)
-            try:
-                from .utils import HttpUtils
-                avatar = await HttpUtils.download_image(
-                    avatar_url,
-                    timeout=10,
-                    proxy=self._get_proxy(),
-                    session=self._get_http_session(),
-                )
-            except Exception as e:
-                logger.warning(f"下载头像失败: {e}，将使用默认空白头像")
-                from PIL import Image
-                avatar = Image.new('RGB', (100, 100), (200, 200, 200))
-
-            fortune_data = self.fortune_generator.get_fortune_for_user(user_id)
-
-            def _render_fortune_to_bytes(src_bg, src_avatar) -> tuple[bytes, bytes]:
+            fortune_data = None
+            if include_fortune:
+                avatar_url = await self._get_avatar_url(event)
                 try:
-                    result_image, bg_bytes = self.fortune_generator.create_fortune_image(
-                        src_bg,
+                    from .utils import HttpUtils
+                    avatar = await HttpUtils.download_image(
+                        avatar_url,
+                        timeout=10,
+                        proxy=self._get_proxy(),
+                        session=self._get_http_session(),
+                    )
+                except Exception as e:
+                    logger.warning(f"下载头像失败: {e}，将使用默认空白头像")
+                    from PIL import Image
+                    avatar = Image.new('RGB', (100, 100), (200, 200, 200))
+
+                fortune_data = self.fortune_generator.get_fortune_for_user(user_id)
+
+            def _render_to_bytes(src_bg, src_avatar) -> tuple[bytes, bytes]:
+                processed = None
+                try:
+                    processed = ImageUtils.process_background(src_bg)
+                    # 裁成 800x1200 后立刻释放 4K 原图，降低叠字阶段的峰值内存
+                    src_bg.close()
+                    src_bg = None
+
+                    bg_bytes = ImageUtils.encode_jpeg(processed, quality=95)
+                    if not include_fortune:
+                        return bg_bytes, bg_bytes
+
+                    result_image = self.fortune_generator.create_fortune_image(
+                        processed,
                         src_avatar,
                         user_name,
                         fortune_data,
                         addition_text,
-                        return_background_bytes=True,
                     )
-                    buf = BytesIO()
                     try:
-                        result_image.save(buf, format="JPEG", quality=90)
-                        return buf.getvalue(), bg_bytes
+                        return ImageUtils.encode_jpeg(result_image, quality=90), bg_bytes
                     finally:
-                        buf.close()
                         result_image.close()
                 finally:
-                    src_bg.close()
+                    if processed is not None:
+                        processed.close()
+                    if src_bg is not None:
+                        src_bg.close()
                     if src_avatar is not None:
                         src_avatar.close()
 
             transferred_to_worker = True
             slot_transferred = True
             result_bytes, bg_bytes = await self._run_worker_holding_slot(
-                sem, _render_fortune_to_bytes, background, avatar
+                sem, _render_to_bytes, background, avatar
             )
         except Exception as e:
-            logger.error(f"生成运势图片失败: {e}")
-            yield event.plain_result(f"生成失败: {e}")
+            logger.error(f"{action_label}图片失败: {e}")
+            yield event.plain_result(f"{action_label}失败: {e}")
             return
         finally:
             if not transferred_to_worker:
@@ -475,23 +452,17 @@ class FortunePlugin(Star):
             if not slot_transferred:
                 sem.release()
 
-        # 出图成功后才原子更新 /last 缓存，避免并发覆写或失败污染
-        self._store_last_background(user_id, bg_bytes)
+        if include_fortune:
+            # 出图成功后才原子更新 /last 缓存，避免并发覆写或失败污染
+            self._store_last_background(user_id, bg_bytes)
 
-        with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as f:
-            f.write(result_bytes)
-            temp_path = f.name
-
-        try:
-            yield event.image_result(temp_path)
-        finally:
-            with contextlib.suppress(OSError):
-                os.remove(temp_path)
+        async for res in self._send_jpeg_bytes(event, result_bytes):
+            yield res
 
     @filter.command("jrys", alias=["今日运势", "运势"])
     async def jrys_cmd(self, event: AstrMessageEvent):
         """生成今日运势图片"""
-        async for res in self._handle_fortune_generation(event):
+        async for res in self._handle_image_generation(event, include_fortune=True):
             yield res
 
     @filter.command("jryst", alias=["jrys_text", "运势文本"])
@@ -513,7 +484,7 @@ class FortunePlugin(Star):
     @filter.command("jrysn")
     async def jrysn(self, event: AstrMessageEvent):
         """随机从图源中获取一张背景图 (无运势信息)"""
-        async for res in self._handle_none_generation(event):
+        async for res in self._handle_image_generation(event, include_fortune=False):
             yield res
 
     @filter.command_group("jrysl")
@@ -524,7 +495,9 @@ class FortunePlugin(Star):
     @jrysl.command("source")
     async def source(self, event: AstrMessageEvent, source_name: str):
         """从指定的图源加载图片生成今日运势"""
-        async for res in self._handle_fortune_generation(event, source_name=source_name):
+        async for res in self._handle_image_generation(
+            event, source_name=source_name, include_fortune=True
+        ):
             yield res
 
     @jrysl.command("last")
@@ -535,21 +508,14 @@ class FortunePlugin(Star):
         if not bg_bytes:
             yield event.plain_result("你还没有生成过今日运势，请先使用 /jrys 生成一次~")
             return
-            
-        temp_path = None
+
         try:
             self.user_last_backgrounds.move_to_end(user_id)
-            with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as f:
-                f.write(bg_bytes)
-                temp_path = f.name
-            yield event.image_result(temp_path)
+            async for res in self._send_jpeg_bytes(event, bg_bytes):
+                yield res
         except Exception as e:
             logger.error(f"获取上次背景图片失败: {e}")
             yield event.plain_result(f"获取失败: {e}")
-        finally:
-            if temp_path:
-                with contextlib.suppress(OSError):
-                    os.remove(temp_path)
 
     @jrysl.command("restore")
     async def restore(self, event: AstrMessageEvent):
@@ -565,5 +531,7 @@ class FortunePlugin(Star):
     @none.command("source")
     async def none_source(self, event: AstrMessageEvent, source_name: str):
         """从指定的图源单独刷图（无运势信息）"""
-        async for res in self._handle_none_generation(event, source_name=source_name):
+        async for res in self._handle_image_generation(
+            event, source_name=source_name, include_fortune=False
+        ):
             yield res
