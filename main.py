@@ -21,7 +21,7 @@ from .utils import ImageUtils
 
 _MAX_LAST_BACKGROUNDS = 20
 _MAX_LAST_BACKGROUND_BYTES = 6 * 1024 * 1024  # 6 MiB total cap across cached JPEGs
-_MAX_CONCURRENT_RENDERS = 2
+_MAX_CONCURRENT_IMAGE_JOBS = 4
 
 
 @register("astrbot_plugin_fortnue", "Xbodw", "今日运势生成器 - 生成一张二次元风格的运势图片", "2.1.3")
@@ -40,7 +40,7 @@ class FortunePlugin(Star):
         # 初始化各模块
         self.fortune_generator = FortuneGenerator(self.data_dir)
         self._http_session: aiohttp.ClientSession | None = None
-        self._render_semaphores: weakref.WeakKeyDictionary[
+        self._image_semaphores: weakref.WeakKeyDictionary[
             asyncio.AbstractEventLoop, asyncio.Semaphore
         ] = weakref.WeakKeyDictionary()
 
@@ -50,12 +50,29 @@ class FortunePlugin(Star):
 
         logger.debug("[插件初始化] FortunePlugin 初始化完成")
 
-    def _get_render_semaphore(self) -> asyncio.Semaphore:
-        """获取绑定到当前事件循环的渲染并发信号量。"""
+    def _get_image_semaphore(self) -> asyncio.Semaphore:
+        """获取绑定到当前事件循环的出图并发信号量（覆盖取图、审核与渲染全流程）。"""
         loop = asyncio.get_running_loop()
-        return self._render_semaphores.setdefault(
-            loop, asyncio.Semaphore(_MAX_CONCURRENT_RENDERS)
+        return self._image_semaphores.setdefault(
+            loop, asyncio.Semaphore(_MAX_CONCURRENT_IMAGE_JOBS)
         )
+
+    @staticmethod
+    async def _run_worker_holding_slot(
+        sem: asyncio.Semaphore,
+        func,
+        *args,
+    ):
+        """将阻塞图片处理交给工作线程，并在线程真正结束后再释放并发名额。"""
+        worker_task = asyncio.create_task(asyncio.to_thread(func, *args))
+
+        def _on_done(task: asyncio.Task) -> None:
+            sem.release()
+            if not task.cancelled():
+                task.exception()
+
+        worker_task.add_done_callback(_on_done)
+        return await asyncio.shield(worker_task)
 
     def _get_http_session(self) -> aiohttp.ClientSession:
         """惰性创建并复用插件级 aiohttp 会话。"""
@@ -323,43 +340,55 @@ class FortunePlugin(Star):
                     logger.warning(f"[{action_label}] 图源 {actual_source} 不可用，将自动切换其他图源")
                     current_source = None
                 retries += 1
+            except BaseException:
+                if background is not None:
+                    background.close()
+                raise
 
         return None, "", f"{action_label}失败: {last_error or '重试次数已达上限'}"
 
     async def _handle_none_generation(self, event: AstrMessageEvent, source_name: str = None):
         """处理纯背景图片获取逻辑"""
-        background, _, error_msg = await self._acquire_approved_background(
-            source_name, action_label="获取"
-        )
-        if error_msg or background is None:
-            yield event.plain_result(error_msg or "获取失败: 未知错误")
-            return
-
-        def _render_none_to_bytes(src_bg) -> bytes:
-            try:
-                result_image = ImageUtils.process_background(src_bg)
-                buf = BytesIO()
-                try:
-                    result_image.save(buf, format="JPEG", quality=95)
-                    return buf.getvalue()
-                finally:
-                    buf.close()
-                    result_image.close()
-            finally:
-                src_bg.close()
-
+        sem = self._get_image_semaphore()
+        await sem.acquire()
+        background = None
         transferred_to_worker = False
+        slot_transferred = False
         try:
-            async with self._get_render_semaphore():
-                transferred_to_worker = True
-                jpeg_bytes = await asyncio.to_thread(_render_none_to_bytes, background)
+            background, _, error_msg = await self._acquire_approved_background(
+                source_name, action_label="获取"
+            )
+            if error_msg or background is None:
+                yield event.plain_result(error_msg or "获取失败: 未知错误")
+                return
+
+            def _render_none_to_bytes(src_bg) -> bytes:
+                try:
+                    result_image = ImageUtils.process_background(src_bg)
+                    buf = BytesIO()
+                    try:
+                        result_image.save(buf, format="JPEG", quality=95)
+                        return buf.getvalue()
+                    finally:
+                        buf.close()
+                        result_image.close()
+                finally:
+                    src_bg.close()
+
+            transferred_to_worker = True
+            slot_transferred = True
+            jpeg_bytes = await self._run_worker_holding_slot(
+                sem, _render_none_to_bytes, background
+            )
         except Exception as e:
             logger.error(f"处理背景图片失败: {e}")
             yield event.plain_result(f"获取失败: {e}")
             return
         finally:
-            if not transferred_to_worker:
+            if not transferred_to_worker and background is not None:
                 background.close()
+            if not slot_transferred:
+                sem.release()
 
         with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as f:
             f.write(jpeg_bytes)
@@ -376,17 +405,21 @@ class FortunePlugin(Star):
         user_id = event.get_sender_id()
         user_name = event.get_sender_name()
 
-        background, addition_text, error_msg = await self._acquire_approved_background(
-            source_name, action_label="生成"
-        )
-        if error_msg or background is None:
-            yield event.plain_result(error_msg or "生成失败: 未知错误")
-            return
-
-        avatar_url = await self._get_avatar_url(event)
+        sem = self._get_image_semaphore()
+        await sem.acquire()
+        background = None
         avatar = None
         transferred_to_worker = False
+        slot_transferred = False
         try:
+            background, addition_text, error_msg = await self._acquire_approved_background(
+                source_name, action_label="生成"
+            )
+            if error_msg or background is None:
+                yield event.plain_result(error_msg or "生成失败: 未知错误")
+                return
+
+            avatar_url = await self._get_avatar_url(event)
             try:
                 from .utils import HttpUtils
                 avatar = await HttpUtils.download_image(
@@ -424,20 +457,23 @@ class FortunePlugin(Star):
                     if src_avatar is not None:
                         src_avatar.close()
 
-            async with self._get_render_semaphore():
-                transferred_to_worker = True
-                result_bytes, bg_bytes = await asyncio.to_thread(
-                    _render_fortune_to_bytes, background, avatar
-                )
+            transferred_to_worker = True
+            slot_transferred = True
+            result_bytes, bg_bytes = await self._run_worker_holding_slot(
+                sem, _render_fortune_to_bytes, background, avatar
+            )
         except Exception as e:
             logger.error(f"生成运势图片失败: {e}")
             yield event.plain_result(f"生成失败: {e}")
             return
         finally:
             if not transferred_to_worker:
-                background.close()
+                if background is not None:
+                    background.close()
                 if avatar is not None:
                     avatar.close()
+            if not slot_transferred:
+                sem.release()
 
         # 出图成功后才原子更新 /last 缓存，避免并发覆写或失败污染
         self._store_last_background(user_id, bg_bytes)
