@@ -16,7 +16,7 @@ from .core import BackgroundManager, FortuneGenerator, ImageModerator
 from .utils import ImageUtils
 
 
-@register("astrbot_plugin_fortnue", "Xbodw", "今日运势生成器 - 生成一张二次元风格的运势图片", "2.1.0")
+@register("astrbot_plugin_fortnue", "Xbodw", "今日运势生成器 - 生成一张二次元风格的运势图片", "2.1.3")
 class FortunePlugin(Star):
     """今日运势插件 - 生成精美的运势图片"""
     
@@ -98,6 +98,14 @@ class FortunePlugin(Star):
         """获取背景管理器"""
         fortune_config = ConfigLoader.get_fortune_config(self._get_config())
         return BackgroundManager(self.backgrounds_data, fortune_config, self._get_proxy())
+
+    def _get_background_retry_count(self) -> int:
+        """获取独立于图片审查的背景图网络重试次数。"""
+        fortune_config = ConfigLoader.get_fortune_config(self._get_config())
+        try:
+            return max(0, min(10, int(fortune_config.get("background_retry_count", 3))))
+        except (TypeError, ValueError):
+            return 3
     
     def _get_moderator(self) -> ImageModerator:
         """获取图片审查器"""
@@ -143,22 +151,35 @@ class FortunePlugin(Star):
     async def _handle_none_generation(self, event: AstrMessageEvent, source_name: str = None):
         """处理纯背景图片获取逻辑"""
         moderator = self._get_moderator()
-        max_retries = moderator.get_max_retries() if moderator.is_enabled() else 0
+        moderation_retries = moderator.get_max_retries() if moderator.is_enabled() else 0
+        max_retries = max(moderation_retries, self._get_background_retry_count())
         
         retries = 0
         last_error = None
+        failed_sources = set()
         
         while retries <= max_retries:
+            actual_source = None
             try:
                 bg_manager = self._get_background_manager()
-                bg_spec = bg_manager.get_background_spec(source_name)
+                bg_spec = bg_manager.get_background_spec(
+                    source_name,
+                    excluded_sources=failed_sources if not source_name else None,
+                )
                 
                 if not bg_spec:
+                    if failed_sources and not source_name:
+                        yield event.plain_result(
+                            f"获取失败: 所有可用图源均连接失败，最后错误: {last_error or '未知错误'}"
+                        )
+                        return
                     if source_name:
                         yield event.plain_result(f"未找到指定的图源: {source_name}")
                     else:
                         yield event.plain_result("暂无背景图源配置，请检查 backgrounds.json~")
                     return
+
+                actual_source = self._get_source_name_from_spec(bg_spec, bg_manager)
 
                 background, _ = await bg_manager.get_background_and_addition(bg_spec)
                 
@@ -208,6 +229,11 @@ class FortunePlugin(Star):
             except Exception as e:
                 logger.error(f"获取背景图片失败: {e}")
                 last_error = str(e)
+                if actual_source and not source_name:
+                    failed_sources.add(actual_source)
+                    logger.warning(
+                        f"[背景获取] 图源 {actual_source} 不可用，将自动切换其他图源"
+                    )
                 retries += 1
         
         yield event.plain_result(f"获取失败: {last_error or '重试次数已达上限'}")
@@ -218,15 +244,18 @@ class FortunePlugin(Star):
         user_name = event.get_sender_name()
 
         moderator = self._get_moderator()
-        max_retries = moderator.get_max_retries() if moderator.is_enabled() else 0
+        moderation_retries = moderator.get_max_retries() if moderator.is_enabled() else 0
+        max_retries = max(moderation_retries, self._get_background_retry_count())
         failed_action = moderator.get_failed_action() if moderator.is_enabled() else "retry_same"
 
         retries = 0
         last_error = None
         current_source = source_name
         tried_sources = set()  # 记录已尝试的图源
+        failed_sources = set()  # 网络或解析失败后不再选择这些图源
 
         while retries <= max_retries:
+            actual_source = None
             try:
                 bg_manager = self._get_background_manager()
 
@@ -235,9 +264,17 @@ class FortunePlugin(Star):
                     logger.info(f"[运势生成] 切换图源模式 - 已尝试过 {current_source}，选择新图源")
                     current_source = None  # 让系统随机选择
 
-                bg_spec = bg_manager.get_background_spec(current_source)
+                bg_spec = bg_manager.get_background_spec(
+                    current_source,
+                    excluded_sources=failed_sources if not source_name else None,
+                )
 
                 if not bg_spec:
+                    if failed_sources and not source_name:
+                        yield event.plain_result(
+                            f"生成失败: 所有可用图源均连接失败，最后错误: {last_error or '未知错误'}"
+                        )
+                        return
                     if source_name:
                         yield event.plain_result(f"未找到指定的图源: {source_name}")
                     else:
@@ -283,6 +320,8 @@ class FortunePlugin(Star):
                                     return
                                 elif failed_action == "switch_source":
                                     logger.info(f"[运势生成] 失败行为: 切换图源")
+                                    if actual_source:
+                                        failed_sources.add(actual_source)
                                     current_source = None  # 下次循环会选择新图源
                                 else:  # retry_same
                                     logger.info(f"[运势生成] 失败行为: 从同一图源重新取图")
@@ -331,6 +370,12 @@ class FortunePlugin(Star):
             except Exception as e:
                 logger.error(f"生成运势图片失败: {e}")
                 last_error = str(e)
+                if actual_source and not source_name:
+                    failed_sources.add(actual_source)
+                    logger.warning(
+                        f"[运势生成] 图源 {actual_source} 不可用，将自动切换其他图源"
+                    )
+                    current_source = None
                 retries += 1
         
         yield event.plain_result(f"生成失败: {last_error or '重试次数已达上限'}")
